@@ -2,11 +2,11 @@ import os
 import json
 import tkinter as tk
 from tkinter import filedialog, messagebox
-from tkinter import Menu
-from threading import Timer
+from tkinter import Menu, ttk
 import subprocess
 import platform
 import pyperclip
+import threading
 
 SETTINGS_FILE = "settings.json"
 
@@ -20,15 +20,12 @@ def save_settings(settings):
     with open(SETTINGS_FILE, "w") as f:
         json.dump(settings, f, indent=2)
 
-def search_files_by_contains(text, folders):
-    matches = []
-    text = text.lower()
+def count_total_files(folders):
+    total = 0
     for folder in folders:
-        for root, dirs, files in os.walk(folder):
-            for file in files:
-                if text in file.lower():
-                    matches.append(os.path.join(root, file))
-    return matches
+        for _, _, files in os.walk(folder):
+            total += len(files)
+    return total
 
 def open_file(path):
     try:
@@ -54,22 +51,36 @@ class FileFinderApp:
     def __init__(self, root):
         self.root = root
         self.root.title("🔍 Document File Finder - DPWH")
-        self.root.geometry("700x600")
+        self.root.geometry("700x650")
 
         self.settings = load_settings()
-        self.search_timer = None
         self.results = []
+        self.cancel_search = False
+        self.search_thread = None
 
         self.create_widgets()
 
     def create_widgets(self):
         # Search input
-        tk.Label(self.root, text="Search (auto match filenames):").pack(anchor='w', padx=2, pady=(10, 0))
-        self.pattern_entry = tk.Entry(self.root, width=60)
-        self.pattern_entry.pack(padx=5, pady=5)
-        self.pattern_entry.bind("<KeyRelease>", self.on_text_change)
+        tk.Label(self.root, text="Search (type filename then click Search):").pack(anchor='w', padx=2, pady=(10, 0))
+        search_frame = tk.Frame(self.root)
+        search_frame.pack(padx=5, pady=5, fill='x')
 
-        # Folder list display
+        self.pattern_entry = tk.Entry(search_frame, width=50)
+        self.pattern_entry.pack(side=tk.LEFT, padx=(0, 5))
+
+        self.search_button = tk.Button(search_frame, text="🔍 Search", command=self.perform_search)
+        self.search_button.pack(side=tk.LEFT)
+
+        self.cancel_button = tk.Button(search_frame, text="❌ Cancel", command=self.cancel_search_action)
+        self.cancel_button.pack(side=tk.LEFT)
+        self.cancel_button.pack_forget()  # hidden by default
+
+        # Progress bar
+        self.progress = ttk.Progressbar(self.root, orient="horizontal", length=500, mode="determinate")
+        self.progress.pack(pady=5)
+
+        # Folder list
         tk.Label(self.root, text="Search Folders:").pack(anchor='w', padx=10)
         self.folder_listbox = tk.Listbox(self.root, height=5)
         self.folder_listbox.pack(fill='x', padx=10)
@@ -77,14 +88,13 @@ class FileFinderApp:
         for folder in self.settings["search_folders"]:
             self.folder_listbox.insert(tk.END, folder)
 
-        # Add/remove folder buttons
+        # Folder buttons
         button_frame = tk.Frame(self.root)
         button_frame.pack(pady=5)
-
         tk.Button(button_frame, text="➕ Add Folder", command=self.add_folder).pack(side=tk.LEFT, padx=5)
         tk.Button(button_frame, text="❌ Remove Selected", command=self.remove_folder).pack(side=tk.LEFT)
 
-        # Result list
+        # Results
         self.result_listbox = tk.Listbox(self.root)
         self.result_listbox.pack(fill='both', expand=True, padx=10, pady=5)
         self.result_listbox.bind("<Double-Button-1>", self.on_double_click)
@@ -94,12 +104,6 @@ class FileFinderApp:
         self.context_menu = Menu(self.root, tearoff=0)
         self.context_menu.add_command(label="📋 Copy Path", command=self.copy_path)
         self.context_menu.add_command(label="📂 Open File Location", command=self.open_file_location)
-
-    def on_text_change(self, event):
-        if self.search_timer:
-            self.search_timer.cancel()
-        self.search_timer = Timer(0.5, lambda: self.root.after(0, self.perform_search))
-        self.search_timer.start()
 
     def add_folder(self):
         folder = filedialog.askdirectory()
@@ -120,26 +124,65 @@ class FileFinderApp:
     def perform_search(self):
         text = self.pattern_entry.get().strip()
         if not text:
+            messagebox.showerror("Error", "Please enter text to search.")
             return
 
-        self.pattern_entry.config(state="disabled")  # disable typing
+        self.pattern_entry.config(state="disabled")
+        self.search_button.config(state="disabled")
+        self.cancel_button.pack(side=tk.LEFT)
+
         self.result_listbox.delete(0, tk.END)
         self.result_listbox.insert(tk.END, "🔄 Searching...")
 
-        # Perform search in background (avoid freezing UI)
-        self.root.after(200, lambda: self._do_search(text))
+        self.progress["value"] = 0
+        self.cancel_search = False
+
+        # Start threaded search
+        self.search_thread = threading.Thread(target=self._do_search, args=(text,))
+        self.search_thread.start()
 
     def _do_search(self, text):
-        self.results = search_files_by_contains(text, self.settings["search_folders"])
-        self.result_listbox.delete(0, tk.END)
+        folders = self.settings["search_folders"]
+        total_files = count_total_files(folders)
+        matches = []
+        processed = 0
 
-        if self.results:
-            for path in self.results:
-                self.result_listbox.insert(tk.END, path)
-        else:
-            self.result_listbox.insert(tk.END, "No files found.")
+        for folder in folders:
+            for root, _, files in os.walk(folder):
+                for file in files:
+                    if self.cancel_search:
+                        self._update_ui_on_finish([], canceled=True)
+                        return
+                    processed += 1
+                    if text.lower() in file.lower():
+                        matches.append(os.path.join(root, file))
+                    self.root.after(0, self._update_progress, processed, total_files)
 
-        self.pattern_entry.config(state="normal")  # re-enable typing
+        self._update_ui_on_finish(matches)
+
+    def _update_progress(self, done, total):
+        self.progress["maximum"] = total
+        self.progress["value"] = done
+
+    def _update_ui_on_finish(self, results, canceled=False):
+        def update():
+            self.result_listbox.delete(0, tk.END)
+            if canceled:
+                self.result_listbox.insert(tk.END, "❌ Search canceled.")
+            elif results:
+                for path in results:
+                    self.result_listbox.insert(tk.END, path)
+                self.results = results
+            else:
+                self.result_listbox.insert(tk.END, "No files found.")
+
+            self.pattern_entry.config(state="normal")
+            self.search_button.config(state="normal")
+            self.cancel_button.pack_forget()
+        self.root.after(0, update)
+
+    def cancel_search_action(self):
+        self.cancel_search = True
 
     def on_double_click(self, event):
         selection = self.result_listbox.curselection()
@@ -170,12 +213,6 @@ class FileFinderApp:
             open_folder(path)
 
 if __name__ == "__main__":
-    try:
-        import pyperclip
-    except ImportError:
-        messagebox.showerror("Missing Dependency", "Please install 'pyperclip' with:\n\npip install pyperclip")
-        raise
-
     root = tk.Tk()
     app = FileFinderApp(root)
     root.mainloop()
